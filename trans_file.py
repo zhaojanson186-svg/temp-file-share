@@ -1,146 +1,164 @@
 import streamlit as st
 import os
 import time
+import json
+import io
 import qrcode
+from datetime import datetime
 from PIL import Image
 
-# 页面基础配置
-st.set_page_config(page_title="私密文件中转站", page_icon="🔒", layout="centered")
+# Google Drive 官方库
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 
 # ====================
-# 核心配置区
+# 1. 核心配置与授权
 # ====================
-# 在这里设置你的专属提取码（默认设为 8888）
+st.set_page_config(page_title="云端永久中转站", page_icon="☁️", layout="centered")
+
 ACCESS_CODE = "8888" 
-# 在这里填入你的 Streamlit Cloud 专属网址（用于生成二维码）
 MY_APP_URL = "https://你的专属网址.streamlit.app" 
 
+def get_gdrive_service():
+    """获取 Google Drive 服务"""
+    try:
+        raw_token = st.secrets["GCP_TOKEN"]
+        token_dict = json.loads(raw_token, strict=False)
+        creds = Credentials.from_authorized_user_info(token_dict)
+        return build('drive', 'v3', credentials=creds)
+    except Exception as e:
+        st.error(f"网盘授权失败，请检查 Secrets: {e}")
+        return None
 
 # ====================
-# 侧边栏：手机扫码直达
+# 2. 侧边栏：扫码功能
 # ====================
 with st.sidebar:
-    st.title("📱 手机扫码直达")
-    st.markdown("用手机浏览器或微信扫一扫，跨设备互传文件。")
-    
-    # 允许用户在网页上动态修改要生成二维码的网址（防呆设计）
-    current_url = st.text_input("当前网址 (可手动修改)", value=MY_APP_URL)
-    
+    st.title("📱 手机同步")
+    current_url = st.text_input("当前网址", value=MY_APP_URL)
     if current_url:
-        # 生成二维码图片
         qr = qrcode.make(current_url)
-        # 在侧边栏显示二维码
         st.image(qr.get_image(), use_column_width=True)
-    
-    st.divider()
-    st.markdown("💡 **提示**: 请确保当前网址与你浏览器地址栏一致。")
+    st.caption("扫码后输入提取码，实现跨设备传图传文件。")
 
 # ====================
-# 提取码拦截逻辑
+# 3. 安全拦截
 # ====================
-st.title("🔒 私密云剪贴板 & 中转站")
+st.title("☁️ 永久云端中转站")
+user_pwd = st.text_input("🔑 请输入提取码：", type="password")
 
-# 密码输入框
-user_pwd = st.text_input("🔑 请输入提取码以访问：", type="password")
-
-# 如果密码不对，直接停止运行后面的代码
 if user_pwd != ACCESS_CODE:
-    if user_pwd: # 如果输入了密码但是不对
-        st.error("提取码错误，请重试！")
+    if user_pwd: st.error("提取码错误！")
+    else: st.info("请输入提取码解锁功能。")
+    st.stop()
+
+# ====================
+# 4. 云端操作函数
+# ====================
+drive_service = get_gdrive_service()
+FOLDER_ID = st.sidebar.text_input("📁 Google Drive 目录 ID", placeholder="填入你要存放的文件夹ID")
+
+def upload_to_drive(file_bytes, file_name, mime_type='application/octet-stream'):
+    """将数据上传到 Google Drive"""
+    if not FOLDER_ID:
+        st.warning("请在侧边栏填入 Google Drive 文件夹 ID！")
+        return None
+    
+    file_metadata = {'name': file_name, 'parents': [FOLDER_ID]}
+    media = MediaFileUpload(file_bytes, mimetype=mime_type, resumable=True)
+    try:
+        file = drive_service.files().create(body=file_metadata, media_body=media, fields='id').execute()
+        return file.get('id')
+    except Exception as e:
+        st.error(f"上传失败: {e}")
+        return None
+
+def list_drive_files():
+    """列出网盘中的文件"""
+    if not FOLDER_ID: return []
+    query = f"'{FOLDER_ID}' in parents and trashed = false"
+    results = drive_service.files().list(q=query, fields="files(id, name, size, mimeType, createdTime)").execute()
+    return results.get('files', [])
+
+# ====================
+# 5. 上传与粘贴区域
+# ====================
+st.subheader("📤 快速上传 / 粘贴图片")
+
+col_up, col_paste = st.columns(2)
+
+with col_up:
+    st.markdown("**文件上传**")
+    uploaded_file = st.file_uploader("选择文件", label_visibility="collapsed")
+    if uploaded_file:
+        with st.spinner("同步至云端..."):
+            # 将 UploadedFile 转为临时文件路径以供上传
+            temp_path = f"temp_{uploaded_file.name}"
+            with open(temp_path, "wb") as f:
+                f.write(uploaded_file.getbuffer())
+            fid = upload_to_drive(temp_path, uploaded_file.name)
+            if fid: 
+                st.toast(f"✅ {uploaded_file.name} 已入库")
+                os.remove(temp_path)
+
+with col_paste:
+    st.markdown("**粘贴图片 (Ctrl+V)**")
+    # Streamlit 1.34.0+ 强力功能
+    pasted_img = st.paste("点击后粘贴图片")
+    if pasted_img:
+        with st.spinner("图片处理中..."):
+            img_name = f"Pasted_{datetime.now().strftime('%m%d_%H%M%S')}.png"
+            temp_img_path = f"temp_{img_name}"
+            pasted_img.save(temp_img_path)
+            fid = upload_to_drive(temp_img_path, img_name, 'image/png')
+            if fid:
+                st.image(pasted_img, caption="已上传至云端", width=150)
+                st.toast("✅ 图片已同步至网盘")
+                os.remove(temp_img_path)
+
+# ====================
+# 6. 云端提取区
+# ====================
+st.divider()
+st.subheader("📥 云端提取列表 (最近上传)")
+
+if drive_service and FOLDER_ID:
+    files = list_drive_files()
+    if not files:
+        st.info("网盘文件夹中暂无内容。")
     else:
-        st.info("请输入提取码解锁功能。")
-    st.stop() # 关键点：停止渲染后续的所有内容
-
-# 如果代码能走到这里，说明提取码输入正确！
-st.success("✅ 验证成功，欢迎使用！")
-st.divider()
-
-
-# ====================
-# 文件清理机制
-# ====================
-UPLOAD_DIR = "temp_uploads"
-if not os.path.exists(UPLOAD_DIR):
-    os.makedirs(UPLOAD_DIR)
-
-def cleanup_old_files():
-    """清理超过 24 小时（86400秒）的文件"""
-    current_time = time.time()
-    for filename in os.listdir(UPLOAD_DIR):
-        file_path = os.path.join(UPLOAD_DIR, filename)
-        if os.path.isfile(file_path):
-            file_mtime = os.path.getmtime(file_path)
-            if current_time - file_mtime > 86400:
-                os.remove(file_path)
-
-cleanup_old_files()
-
-
-# ====================
-# 第一部分：上传文件
-# ====================
-st.subheader("📤 功能 1：上传文件")
-uploaded_file = st.file_uploader("选择你要暂存的文件 (单次 200MB 以内)")
-
-if uploaded_file is not None:
-    save_path = os.path.join(UPLOAD_DIR, uploaded_file.name)
-    with open(save_path, "wb") as f:
-        f.write(uploaded_file.getbuffer())
-    st.success(f"✅ 文件 `{uploaded_file.name}` 上传成功！")
-
-
-# ====================
-# 第二部分：在线记事本
-# ====================
-st.subheader("📝 功能 2：在线记事本 (云剪贴板)")
-text_content = st.text_area("在此输入或粘贴文字：", height=150)
-
-col1, col2 = st.columns([3, 1])
-with col1:
-    txt_filename = st.text_input("给文本起个名字（无需加 .txt）：", value="未命名便签")
-with col2:
-    st.write("") 
-    st.write("") 
-    if st.button("💾 保存为 TXT", use_container_width=True):
-        if text_content.strip() == "":
-            st.warning("⚠️ 内容不能为空哦！")
-        else:
-            safe_filename = txt_filename.strip() + ".txt"
-            save_path = os.path.join(UPLOAD_DIR, safe_filename)
-            with open(save_path, "w", encoding="utf-8") as f:
-                f.write(text_content)
-            st.success(f"✅ 文本已成功保存为 `{safe_filename}`！")
-
-st.divider()
-
-# ====================
-# 第三部分：下载文件
-# ====================
-st.subheader("📥 提取区：可下载的文件列表")
-
-available_files = os.listdir(UPLOAD_DIR)
-
-if not available_files:
-    st.info("当前没有可用的文件。")
+        # 按创建时间排序（最新的在前）
+        for f in sorted(files, key=lambda x: x['createdTime'], reverse=True):
+            with st.container(border=True):
+                c_name, c_act = st.columns([7, 3])
+                with c_name:
+                    st.write(f"📄 **{f['name']}**")
+                    size_mb = int(f.get('size', 0)) / (1024*1024)
+                    st.caption(f"大小: {size_mb:.2f} MB | 类型: {f['mimeType']}")
+                
+                with c_act:
+                    # 下载逻辑
+                    request = drive_service.files().get_media(fileId=f['id'])
+                    fh = io.BytesIO()
+                    downloader = MediaIoBaseDownload(fh, request)
+                    done = False
+                    while done is False:
+                        status, done = downloader.next_chunk()
+                    
+                    st.download_button(
+                        label="下载",
+                        data=fh.getvalue(),
+                        file_name=f['name'],
+                        key=f"dl_{f['id']}",
+                        use_container_width=True
+                    )
+                    
+                    if st.button("删除", key=f"del_{f['id']}", use_container_width=True):
+                        drive_service.files().delete(fileId=f['id']).execute()
+                        st.rerun()
 else:
-    for filename in available_files:
-        file_path = os.path.join(UPLOAD_DIR, filename)
-        file_size_kb = os.path.getsize(file_path) / 1024
-        
-        col_name, col_size, col_btn = st.columns([5, 2, 2])
-        
-        with col_name:
-            st.write(f"📄 **{filename}**")
-        with col_size:
-            if file_size_kb < 1024:
-                st.write(f"{file_size_kb:.1f} KB")
-            else:
-                st.write(f"{(file_size_kb / 1024):.2f} MB")
-        with col_btn:
-            with open(file_path, "rb") as f:
-                st.download_button(
-                    label="点击下载",
-                    data=f,
-                    file_name=filename,
-                    key=f"download_{filename}" 
-                )
+    st.warning("💡 请在侧边栏配置 Google Drive 文件夹 ID 以开启永久存储。")
+
+st.divider()
+st.caption("注：本工具直接与你的 Google Drive 通讯，文件永久保存，除非你手动删除。")
