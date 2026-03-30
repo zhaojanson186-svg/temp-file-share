@@ -12,6 +12,9 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
 
+# 第三方组件：真实的图片粘贴功能
+from streamlit_paste_button import paste_image_button
+
 # ====================
 # 1. 核心配置与授权
 # ====================
@@ -28,7 +31,7 @@ def get_gdrive_service():
         creds = Credentials.from_authorized_user_info(token_dict)
         return build('drive', 'v3', credentials=creds)
     except Exception as e:
-        st.error(f"网盘授权失败，请检查 Secrets: {e}")
+        st.error(f"网盘授权失败，请检查 Secrets 配置: {e}")
         return None
 
 # ====================
@@ -78,8 +81,12 @@ def list_drive_files():
     """列出网盘中的文件"""
     if not FOLDER_ID: return []
     query = f"'{FOLDER_ID}' in parents and trashed = false"
-    results = drive_service.files().list(q=query, fields="files(id, name, size, mimeType, createdTime)").execute()
-    return results.get('files', [])
+    try:
+        results = drive_service.files().list(q=query, fields="files(id, name, size, mimeType, createdTime)").execute()
+        return results.get('files', [])
+    except Exception as e:
+        st.error(f"获取文件列表失败: {e}")
+        return []
 
 # ====================
 # 5. 上传与粘贴区域
@@ -93,7 +100,6 @@ with col_up:
     uploaded_file = st.file_uploader("选择文件", label_visibility="collapsed")
     if uploaded_file:
         with st.spinner("同步至云端..."):
-            # 将 UploadedFile 转为临时文件路径以供上传
             temp_path = f"temp_{uploaded_file.name}"
             with open(temp_path, "wb") as f:
                 f.write(uploaded_file.getbuffer())
@@ -104,16 +110,25 @@ with col_up:
 
 with col_paste:
     st.markdown("**粘贴图片 (Ctrl+V)**")
-    # Streamlit 1.34.0+ 强力功能
-    pasted_img = st.paste("点击后粘贴图片")
-    if pasted_img:
+    
+    # 使用真实的第三方组件拦截剪贴板
+    paste_result = paste_image_button(
+        label="📋 点击此处，然后按 Ctrl+V 粘贴",
+        text_color="#000000",
+        background_color="#f0f2f6"
+    )
+    
+    if paste_result.image_data is not None:
         with st.spinner("图片处理中..."):
             img_name = f"Pasted_{datetime.now().strftime('%m%d_%H%M%S')}.png"
             temp_img_path = f"temp_{img_name}"
-            pasted_img.save(temp_img_path)
+            
+            # paste_result.image_data 是一个标准的 PIL 图像对象，直接保存
+            paste_result.image_data.save(temp_img_path, format="PNG")
+            
             fid = upload_to_drive(temp_img_path, img_name, 'image/png')
             if fid:
-                st.image(pasted_img, caption="已上传至云端", width=150)
+                st.image(paste_result.image_data, caption="已上传至云端", width=150)
                 st.toast("✅ 图片已同步至网盘")
                 os.remove(temp_img_path)
 
@@ -128,7 +143,6 @@ if drive_service and FOLDER_ID:
     if not files:
         st.info("网盘文件夹中暂无内容。")
     else:
-        # 按创建时间排序（最新的在前）
         for f in sorted(files, key=lambda x: x['createdTime'], reverse=True):
             with st.container(border=True):
                 c_name, c_act = st.columns([7, 3])
@@ -138,25 +152,27 @@ if drive_service and FOLDER_ID:
                     st.caption(f"大小: {size_mb:.2f} MB | 类型: {f['mimeType']}")
                 
                 with c_act:
-                    # 下载逻辑
-                    request = drive_service.files().get_media(fileId=f['id'])
-                    fh = io.BytesIO()
-                    downloader = MediaIoBaseDownload(fh, request)
-                    done = False
-                    while done is False:
-                        status, done = downloader.next_chunk()
-                    
-                    st.download_button(
-                        label="下载",
-                        data=fh.getvalue(),
-                        file_name=f['name'],
-                        key=f"dl_{f['id']}",
-                        use_container_width=True
-                    )
-                    
-                    if st.button("删除", key=f"del_{f['id']}", use_container_width=True):
-                        drive_service.files().delete(fileId=f['id']).execute()
-                        st.rerun()
+                    try:
+                        request = drive_service.files().get_media(fileId=f['id'])
+                        fh = io.BytesIO()
+                        downloader = MediaIoBaseDownload(fh, request)
+                        done = False
+                        while done is False:
+                            status, done = downloader.next_chunk()
+                        
+                        st.download_button(
+                            label="下载",
+                            data=fh.getvalue(),
+                            file_name=f['name'],
+                            key=f"dl_{f['id']}",
+                            use_container_width=True
+                        )
+                        
+                        if st.button("删除", key=f"del_{f['id']}", use_container_width=True):
+                            drive_service.files().delete(fileId=f['id']).execute()
+                            st.rerun()
+                    except Exception as e:
+                        st.error("此文件无法提供下载（可能是权限或格式受限）")
 else:
     st.warning("💡 请在侧边栏配置 Google Drive 文件夹 ID 以开启永久存储。")
 
